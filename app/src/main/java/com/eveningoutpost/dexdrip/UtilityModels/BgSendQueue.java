@@ -1,7 +1,9 @@
 package com.eveningoutpost.dexdrip.UtilityModels;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.os.Bundle;
 import android.preference.PreferenceManager;
 import android.provider.BaseColumns;
 import android.util.Log;
@@ -55,7 +57,7 @@ public class BgSendQueue extends Model {
                 .where("mongo_success = ?", false)
                 .where("operation_type = ?", "create")
                 .orderBy("_ID asc")
-                .limit(10)
+                .limit(30)
                 .execute();
     }
 
@@ -65,17 +67,38 @@ public class BgSendQueue extends Model {
         bgSendQueue.bgReading = bgReading;
         bgSendQueue.success = false;
         bgSendQueue.mongo_success = false;
-
         bgSendQueue.save();
 
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
 
+        Intent updateIntent = new Intent(Intents.ACTION_NEW_BG_ESTIMATE_NO_DATA);
+        context.sendBroadcast(updateIntent);
+
         if (prefs.getBoolean("cloud_storage_mongodb_enable", false) || prefs.getBoolean("cloud_storage_api_enable", false)) {
             Log.w("SENSOR QUEUE:", String.valueOf(bgSendQueue.mongo_success));
-            if (operation_type == "create") {
+            if (operation_type.compareTo("create") == 0) {
                 MongoSendTask task = new MongoSendTask(context, bgSendQueue);
                 task.execute();
             }
+        }
+
+        if(prefs.getBoolean("broadcast_data_through_intents", false)) {
+            Log.i("SENSOR QUEUE:", "Broadcast data");
+            final Bundle bundle = new Bundle();
+            bundle.putDouble(Intents.EXTRA_BG_ESTIMATE, bgReading.calculated_value);
+            bundle.putDouble(Intents.EXTRA_BG_SLOPE, bgReading.calculated_value_slope);
+            bundle.putString(Intents.EXTRA_BG_SLOPE_NAME, bgReading.slopeName());
+            bundle.putInt(Intents.EXTRA_SENSOR_BATTERY, bgReading.sensor.latest_battery_level);
+            bundle.putLong(Intents.EXTRA_TIMESTAMP, bgReading.timestamp);
+
+            Intent intent = new Intent(Intents.ACTION_NEW_BG_ESTIMATE);
+            intent.putExtras(bundle);
+            context.sendBroadcast(intent, Intents.RECEIVER_PERMISSION);
+        }
+
+        if(prefs.getBoolean("broadcast_to_pebble", false)) {
+            PebbleSync pebbleSync = new PebbleSync();
+            pebbleSync.sendData(context, bgReading);
         }
     }
 

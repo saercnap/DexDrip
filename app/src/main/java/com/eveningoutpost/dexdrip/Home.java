@@ -1,6 +1,8 @@
 package com.eveningoutpost.dexdrip;
 
 import android.app.Activity;
+import android.app.NotificationManager;
+import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -8,10 +10,16 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Bundle;
 import android.preference.PreferenceManager;
+import android.support.v4.app.NotificationCompat;
 import android.support.v4.widget.DrawerLayout;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.eveningoutpost.dexdrip.Models.ActiveBluetoothDevice;
 import com.eveningoutpost.dexdrip.Models.BgReading;
@@ -19,7 +27,13 @@ import com.eveningoutpost.dexdrip.Models.Calibration;
 import com.eveningoutpost.dexdrip.Services.WixelReader;
 import com.eveningoutpost.dexdrip.UtilityModels.BgGraphBuilder;
 import com.eveningoutpost.dexdrip.UtilityModels.CollectionServiceStarter;
+import com.eveningoutpost.dexdrip.UtilityModels.Intents;
+import com.eveningoutpost.dexdrip.UtilityModels.Notifications;
+import com.eveningoutpost.dexdrip.utils.DatabaseUtil;
+import com.eveningoutpost.dexdrip.utils.ShareNotification;
 
+
+import java.io.File;
 import java.text.DecimalFormat;
 import java.util.Date;
 import java.util.List;
@@ -49,6 +63,7 @@ public class Home extends Activity implements NavigationDrawerFragment.Navigatio
 
     public BgGraphBuilder bgGraphBuilder;
     BroadcastReceiver _broadcastReceiver;
+    BroadcastReceiver newDataReceiver;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -90,7 +105,14 @@ public class Home extends Activity implements NavigationDrawerFragment.Navigatio
                 }
             }
         };
+        newDataReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                updateCurrentBgInfo();
+            }
+        };
         registerReceiver(_broadcastReceiver, new IntentFilter(Intent.ACTION_TIME_TICK));
+        registerReceiver(newDataReceiver, new IntentFilter(Intents.ACTION_NEW_BG_ESTIMATE_NO_DATA));
         mNavigationDrawerFragment = (NavigationDrawerFragment) getFragmentManager().findFragmentById(R.id.navigation_drawer);
         mNavigationDrawerFragment.setUp(R.id.navigation_drawer, (DrawerLayout) findViewById(R.id.drawer_layout), menu_name, this);
         holdViewport.set(0, 0, 0, 0);
@@ -116,7 +138,6 @@ public class Home extends Activity implements NavigationDrawerFragment.Navigatio
         previewChart.setViewportChangeListener(new ViewportListener());
         chart.setViewportChangeListener(new ChartViewPortListener());
         setViewport();
-
     }
 
     private class ChartViewPortListener implements ViewportChangeListener {
@@ -164,8 +185,12 @@ public class Home extends Activity implements NavigationDrawerFragment.Navigatio
     @Override
     public void onPause() {
         super.onPause();
-        if (_broadcastReceiver != null)
+        if (_broadcastReceiver != null) {
             unregisterReceiver(_broadcastReceiver);
+        }
+        if(newDataReceiver != null) {
+            unregisterReceiver(newDataReceiver);
+        }
     }
 
     public void updateCurrentBgInfo() {
@@ -173,14 +198,13 @@ public class Home extends Activity implements NavigationDrawerFragment.Navigatio
         final TextView notificationText = (TextView)findViewById(R.id.notices);
         notificationText.setText("");
         boolean isBTWixel = CollectionServiceStarter.isBTWixel(getApplicationContext());
-        if((isBTWixel &&ActiveBluetoothDevice.first() != null) ||
-            (!isBTWixel && WixelReader.IsConfigured(getApplicationContext()))) {
+        if((isBTWixel && ActiveBluetoothDevice.first() != null) || (!isBTWixel && WixelReader.IsConfigured(getApplicationContext()))) {
             if (Sensor.isActive() && (Sensor.currentSensor().started_at + (60000 * 60 * 2)) < new Date().getTime()) {
                 if (BgReading.latest(2).size() > 1) {
                     List<Calibration> calibrations = Calibration.latest(2);
                     if (calibrations.size() > 1) {
-                        if (calibrations.get(0).slope <= 0.5 || calibrations.get(0).slope >= 1.4) {
-                            notificationText.setText("Possible bad calibration slope, recommend double calibration");
+                        if (calibrations.get(0).possible_bad != null && calibrations.get(0).possible_bad == true && calibrations.get(1).possible_bad != null && calibrations.get(1).possible_bad != true) {
+                            notificationText.setText("Possible bad calibration slope, please have a glass of water, wash hands, then recalibrate in a few!");
                         }
                         displayCurrentInfo();
                     } else {
@@ -220,36 +244,77 @@ public class Home extends Activity implements NavigationDrawerFragment.Navigatio
             currentBgValueText.setPaintFlags(currentBgValueText.getPaintFlags() & (~Paint.STRIKE_THRU_TEXT_FLAG));
         }
         BgReading lastBgreading = BgReading.lastNoSenssor();
-
-        if (lastBgreading != null) {
-            double estimate =0;
+        boolean predictive = PreferenceManager.getDefaultSharedPreferences(getApplicationContext()).getBoolean("predictive_bg", false);
+            if (lastBgreading != null) {
+            double estimate = 0;
             if ((new Date().getTime()) - (60000 * 11) - lastBgreading.timestamp > 0) {
                 notificationText.setText("Signal Missed");
-                estimate = BgReading.estimated_bg(lastBgreading.timestamp + (6000 * 7));
-                currentBgValueText.setText(df.format(estimate));
+                if(!predictive){
+                    estimate=lastBgreading.calculated_value;
+                } else {
+                    estimate = BgReading.estimated_bg(lastBgreading.timestamp + (6000 * 7));
+                }
+                currentBgValueText.setText(bgGraphBuilder.unitized_string(estimate));
                 currentBgValueText.setPaintFlags(currentBgValueText.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG);
             } else {
-                if (lastBgreading != null) {
+                if(!predictive){
+                    estimate=lastBgreading.calculated_value;
+                    String stringEstimate = bgGraphBuilder.unitized_string(estimate);
+                    currentBgValueText.setText( stringEstimate + " " + BgReading.slopeArrow((lastBgreading.staticSlope() * 60000)));
+                } else {
                     estimate = BgReading.activePrediction();
-                    String stringEstimate;
-                    if (estimate >= 400) {
-                        stringEstimate = "HIGH";
-                    } else if (estimate <= 40) {
-                        stringEstimate = "LOW";
-                    } else {
-                        stringEstimate = df.format(estimate);
-                    }
+                    String stringEstimate = bgGraphBuilder.unitized_string(estimate);
                     currentBgValueText.setText( stringEstimate + " " + BgReading.slopeArrow());
                 }
             }
-            if(estimate <= bgGraphBuilder.lowMark) {
+            if(bgGraphBuilder.unitized(estimate) <= bgGraphBuilder.lowMark) {
                 currentBgValueText.setTextColor(Color.parseColor("#C30909"));
-            } else if(estimate >= bgGraphBuilder.highMark) {
+            } else if(bgGraphBuilder.unitized(estimate) >= bgGraphBuilder.highMark) {
                 currentBgValueText.setTextColor(Color.parseColor("#FFBB33"));
             } else {
                 currentBgValueText.setTextColor(Color.WHITE);
             }
         }
     setupCharts();
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        getMenuInflater().inflate(R.menu.menu_home, menu);
+        return super.onCreateOptionsMenu(menu);
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == R.id.action_export_database) {
+            new AsyncTask<Void, Void, String>() {
+                @Override
+                protected String doInBackground(Void... params) {
+                    return DatabaseUtil.saveSql(getBaseContext());
+                }
+
+                @Override
+                protected void onPostExecute(String filename) {
+                    super.onPostExecute(filename);
+
+                    final Context ctx = getApplicationContext();
+
+                    Toast.makeText(ctx, "Export stored at " + filename, Toast.LENGTH_SHORT).show();
+
+                    final NotificationCompat.Builder n = new NotificationCompat.Builder(ctx);
+                    n.setContentTitle("Export complete");
+                    n.setContentText("Ready to be sent.");
+                    n.setAutoCancel(true);
+                    n.setSmallIcon(R.drawable.ic_action_communication_invert_colors_on);
+                    ShareNotification.viewOrShare("application/octet-stream", Uri.fromFile(new File(filename)), n, ctx);
+
+                    final NotificationManager manager = (NotificationManager) ctx.getSystemService(Service.NOTIFICATION_SERVICE);
+                    manager.notify(Notifications.exportCompleteNotificationId, n.build());
+                }
+            }.execute();
+
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
     }
 }

@@ -1,6 +1,8 @@
 package com.eveningoutpost.dexdrip.Models;
 
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.preference.PreferenceManager;
 import android.provider.BaseColumns;
 import android.util.Log;
 
@@ -10,6 +12,7 @@ import com.activeandroid.annotation.Table;
 import com.activeandroid.query.Select;
 import com.eveningoutpost.dexdrip.Sensor;
 import com.eveningoutpost.dexdrip.UtilityModels.BgSendQueue;
+import com.eveningoutpost.dexdrip.UtilityModels.Constants;
 import com.eveningoutpost.dexdrip.UtilityModels.Notifications;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -26,7 +29,6 @@ public class BgReading extends Model {
     private final static String TAG = BgReading.class.getSimpleName();
     //TODO: Have these as adjustable settings!!
     public final static double BESTOFFSET = (60000 * 0); // Assume readings are about x minutes off from actual!
-    public final static double SLOPEREADAHEAD = (60000 * 3); // Forcast the rate of change 3 minutes out!
 
     @Column(name = "sensor", index = true)
     public Sensor sensor;
@@ -100,13 +102,30 @@ public class BgReading extends Model {
     @Column(name = "snyced")
     public boolean synced;
 
-    public String displayValue() {
+    public double calculated_value_mmol() {
+        return mmolConvert(calculated_value);
+    }
+
+    public double mmolConvert(double mgdl) {
+        return mgdl * Constants.MGDL_TO_MMOLL;
+    }
+
+    public String displayValue(Context context) {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        String unit = prefs.getString("units", "mgdl");
         DecimalFormat df = new DecimalFormat("#");
         df.setMaximumFractionDigits(0);
+
         if (calculated_value >= 400) {
             return "HIGH";
         } else if (calculated_value >= 40) {
-            return df.format(calculated_value);
+            if(unit.compareTo("mgdl") == 0) {
+                df.setMaximumFractionDigits(0);
+                return df.format(calculated_value);
+            } else {
+                df.setMaximumFractionDigits(1);
+                return df.format(calculated_value_mmol());
+            }
         } else {
             return "LOW";
         }
@@ -115,6 +134,11 @@ public class BgReading extends Model {
     public static double activeSlope() {
         BgReading bgReading = BgReading.lastNoSenssor();
         double slope = (2 * bgReading.a * (new Date().getTime() + BESTOFFSET)) + bgReading.b;
+        Log.w(TAG, "ESTIMATE SLOPE" + slope);
+        return slope;
+    }
+    public double staticSlope() {
+        double slope = (2 * this.a * this.timestamp) + this.b;
         Log.w(TAG, "ESTIMATE SLOPE" + slope);
         return slope;
     }
@@ -131,7 +155,7 @@ public class BgReading extends Model {
     }
 
     //*******CLASS METHODS***********//
-    public static BgReading create(double raw_data, Context context) {
+    public static BgReading create(double raw_data, Context context, Long timestamp) {
         BgReading bgReading = new BgReading();
         Sensor sensor = Sensor.currentSensor();
         if (sensor != null) {
@@ -140,20 +164,14 @@ public class BgReading extends Model {
                 bgReading.sensor = sensor;
                 bgReading.sensor_uuid = sensor.uuid;
                 bgReading.raw_data = (raw_data / 1000);
-                bgReading.timestamp = new Date().getTime();
+                bgReading.timestamp = timestamp;
                 bgReading.uuid = UUID.randomUUID().toString();
                 bgReading.time_since_sensor_started = bgReading.timestamp - sensor.started_at;
                 bgReading.synced = false;
+                bgReading.calibration_flag = false;
 
-                //TODO: THIS IS A BIG SILLY IDEA, THIS WILL HAVE TO CHANGE ONCE WE GET SOME REAL DATA FROM THE START OF SENSOR LIFE
-                double adjust_for = (86400000 * 1.8) - bgReading.time_since_sensor_started;
-                if (adjust_for > 0) {
-                    bgReading.age_adjusted_raw_value = ((50 / 20) * (adjust_for / (86400000 * 1.8))) * (raw_data / 1000);
-                    Log.w("RAW VALUE ADJUSTMENT: ", "FROM:" + raw_data + " TO: " + bgReading.age_adjusted_raw_value);
-                } else {
-                    bgReading.age_adjusted_raw_value = (raw_data / 1000);
-                }
-                
+                bgReading.calculateAgeAdjustedRawValue();
+
                 bgReading.save();
                 bgReading.perform_calculations();
             } else {
@@ -163,32 +181,33 @@ public class BgReading extends Model {
                 bgReading.calibration = calibration;
                 bgReading.calibration_uuid = calibration.uuid;
                 bgReading.raw_data = (raw_data/1000);
-                bgReading.timestamp = new Date().getTime();
+                bgReading.timestamp = timestamp;
                 bgReading.uuid = UUID.randomUUID().toString();
                 bgReading.time_since_sensor_started = bgReading.timestamp - sensor.started_at;
                 bgReading.synced = false;
 
-                //TODO: THIS IS A BIG SILLY IDEA, THIS WILL HAVE TO CHANGE ONCE WE GET SOME REAL DATA FROM THE START OF SENSOR LIFE
-                double adjust_for = (86400000 * 1.9) - bgReading.time_since_sensor_started;
-                if (adjust_for > 0) {
-                    bgReading.age_adjusted_raw_value = (((.45) * (adjust_for / (86400000 * 1.9))) * (raw_data/1000)) + (raw_data/1000);
-                    Log.w("RAW VALUE ADJUSTMENT: ", "FROM:" + (raw_data/1000) + " TO: " + bgReading.age_adjusted_raw_value);
+                bgReading.calculateAgeAdjustedRawValue();
+
+                if(calibration.check_in) {
+                    double firstAdjSlope = calibration.first_slope + (calibration.first_decay * (Math.ceil(new Date().getTime() - calibration.timestamp)/(1000 * 60 * 10)));
+//                    double secondAdjSlope = calibration.first_slope + (calibration.first_decay * ((new Date().getTime() - calibration.timestamp)/(1000 * 60 * 10)));
+                    double calSlope = (calibration.first_scale / firstAdjSlope)*1000;
+                    double calIntercept = ((calibration.first_scale * calibration.first_intercept) / firstAdjSlope)*-1;
+//                    double calSlope = ((calibration.second_scale / secondAdjSlope) + (3 * calibration.first_scale / firstAdjSlope)) * 250;
+//                    double calIntercept = (((calibration.second_scale * calibration.second_intercept) / secondAdjSlope) + ((3 * calibration.first_scale * calibration.first_intercept) / firstAdjSlope)) / -4;
+                    bgReading.calculated_value = (((calSlope * bgReading.raw_data) + calIntercept) - 5);
+
                 } else {
-                    bgReading.age_adjusted_raw_value = (raw_data/1000);
+                    BgReading lastBgReading = BgReading.last();
+                    if (lastBgReading != null && lastBgReading.calibration != null) {
+                        if (lastBgReading.calibration_flag == true && ((lastBgReading.timestamp + (60000 * 20)) > bgReading.timestamp) && ((lastBgReading.calibration.timestamp + (60000 * 20)) > bgReading.timestamp)) {
+                            lastBgReading.calibration.rawValueOverride(BgReading.weightedAverageRaw(lastBgReading.timestamp, bgReading.timestamp, lastBgReading.calibration.timestamp, lastBgReading.age_adjusted_raw_value, bgReading.age_adjusted_raw_value), context);
+                        }
+                    }
+                    bgReading.calculated_value = ((calibration.slope * bgReading.age_adjusted_raw_value) + calibration.intercept);
                 }
 
-                BgReading lastBgReading = BgReading.last();
-                if (lastBgReading != null && lastBgReading.calibration != null) {
-                    if (lastBgReading.calibration_flag == true && ((lastBgReading.timestamp + (60000 * 20)) > bgReading.timestamp)) {
-                        lastBgReading.calibration.rawValueOverride(BgReading.weightedAverageRaw(lastBgReading.timestamp, bgReading.timestamp, lastBgReading.calibration.timestamp, lastBgReading.age_adjusted_raw_value, bgReading.age_adjusted_raw_value), context);
-                    }
-                }
-                bgReading.calculated_value = ((calibration.slope * bgReading.age_adjusted_raw_value) + calibration.intercept);
-                if (bgReading.calculated_value <= 40) {
-                    bgReading.calculated_value = 40;
-                } else if (bgReading.calculated_value >= 400) {
-                    bgReading.calculated_value = 400;
-                }
+                bgReading.calculated_value = Math.min(400, Math.max(40, bgReading.calculated_value));
                 Log.w(TAG, "NEW VALUE CALCULATED AT: " + bgReading.calculated_value);
 
                 bgReading.save();
@@ -204,6 +223,10 @@ public class BgReading extends Model {
 
     public static String slopeArrow() {
         double slope = (float) (BgReading.activeSlope() * 60000);
+        return slopeArrow(slope);
+    }
+
+    public static String slopeArrow(double slope) {
         String arrow;
         if (slope <= (-3.5)) {
             arrow = "\u21ca";
@@ -268,6 +291,7 @@ public class BgReading extends Model {
                 .orderBy("_ID desc")
                 .executeSingle();
     }
+
     public static List<BgReading> latest(int number) {
         Sensor sensor = Sensor.currentSensor();
         if (sensor == null) { return null; }
@@ -326,14 +350,6 @@ public class BgReading extends Model {
 
     //*******INSTANCE METHODS***********//
     public void perform_calculations() {
-        Calibration calibration = Calibration.last();
-        if (calibration == null) {
-            Log.w(TAG, "NO CALIBRATION DATA, CANNOT CALCULATE CURRENT VALUES.");
-        } else {
-            calculated_value = ((calibration.slope * age_adjusted_raw_value) + calibration.intercept);
-            Log.w(TAG, "NEW VALUE CALCULATED AT: " + calculated_value);
-        }
-        save();
         find_new_curve();
         find_new_raw_curve();
         find_slope();
@@ -413,6 +429,16 @@ public class BgReading extends Model {
         }
     }
 
+    public void calculateAgeAdjustedRawValue(){
+        double adjust_for = (86400000 * 1.9) - time_since_sensor_started;
+        if (adjust_for > 0) {
+            age_adjusted_raw_value = (((.45) * (adjust_for / (86400000 * 1.9))) * raw_data) + raw_data;
+            Log.w("RAW VALUE ADJUSTMENT: ", "FROM:" + raw_data + " TO: " + age_adjusted_raw_value);
+        } else {
+            age_adjusted_raw_value = raw_data;
+        }
+    }
+
     public void find_new_raw_curve() {
         List<BgReading> last_3 = BgReading.latest(3);
         if (last_3.size() == 3) {
@@ -476,8 +502,4 @@ public class BgReading extends Model {
                 .create();
         return gson.toJson(this);
     }
-
-
-    //TODO: Add Sync instance method
-
 }
